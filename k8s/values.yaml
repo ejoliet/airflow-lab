@@ -1,0 +1,37 @@
+# Helm values for the official apache-airflow/airflow chart (Airflow 3.x).
+# AIDEV-NOTE: verify your chart version supports airflowVersion 3.1.x
+# (helm search repo apache-airflow; component names like api-server changed
+# between chart releases — see GUIDE Lab 7 troubleshooting).
+executor: KubernetesExecutor
+
+airflowVersion: "3.1.8"
+defaultAirflowRepository: airflow-lab
+defaultAirflowTag: "3.1.8-lab"
+images:
+  airflow:
+    repository: airflow-lab
+    tag: "3.1.8-lab"
+    pullPolicy: Never        # image is `kind load`-ed, never pulled
+
+# AIDEV-NOTE: 3.1.x — keep ONE triggerer replica (duplicate watcher events
+# with >1 replica; fixed upstream in 3.2.2).
+triggerer:
+  replicas: 1
+
+dags:
+  persistence:
+    enabled: false           # DAGs are baked into the image
+  gitSync:
+    enabled: false
+
+# Applied to all Airflow pods, INCLUDING KubernetesExecutor worker pods —
+# tasks (S3Hook) need the same LocalStack-pointed connection as the triggerer.
+env:
+  - name: AIRFLOW_CONN_AWS_DEFAULT
+    value: '{"conn_type":"aws","login":"test","password":"test","extra":{"region_name":"us-east-1","endpoint_url":"http://localstack:4566"}}'
+  - name: AIRFLOW__CORE__LOAD_EXAMPLES
+    value: "false"
+
+# Lab-only: chart-managed Postgres. On EKS: external Aurora + disable this.
+postgresql:
+  enabled: true

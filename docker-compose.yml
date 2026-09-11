@@ -1,0 +1,58 @@
+# AIDEV-NOTE: minimal lab for Airflow 3.1.8 AssetWatcher + SQS (LocalStack).
+# `docker compose up` -> Airflow UI on :8080, SQS emulator on :4566.
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  localstack:
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=sqs,s3
+    volumes:
+      # AIDEV-NOTE: init hook creates the queue at startup (see localstack/init-queue.sh)
+      - ./localstack/init-queue.sh:/etc/localstack/init/ready.d/init-queue.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs list-queues | grep demo-events"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  airflow:
+    image: apache/airflow:3.1.8
+    command: standalone   # runs api-server + scheduler + dag-processor + TRIGGERER (watchers live there)
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # AIDEV-NOTE: dev-only convenience; bake into an image for anything real.
+      # common-messaging >=2.0 is the AIP-82 interface used by MessageQueueTrigger.
+      _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-common-messaging>=2.0 apache-airflow-providers-amazon"
+      # AWS connection pointed at LocalStack. Dummy creds are fine; endpoint_url is what matters.
+      AIRFLOW_CONN_AWS_DEFAULT: >-
+        {"conn_type":"aws","login":"test","password":"test",
+         "extra":{"region_name":"us-east-1","endpoint_url":"http://localstack:4566"}}
+    volumes:
+      - ./dags:/opt/airflow/dags
+    restart: unless-stopped
+
+volumes:
+  pgdata:

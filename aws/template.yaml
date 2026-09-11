@@ -1,0 +1,135 @@
+# S3 -> SQS -> Lambda -> Airflow asset-event API (phase 3, real AWS).
+# Greenfield stack per CFN-first rule. For an EXISTING bucket, the
+# NotificationConfiguration must be added out-of-band (console/CLI/custom
+# resource) — CFN can only set notifications on buckets it owns.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: S3 event notifications to Airflow asset events via SQS-batched Lambda
+
+Parameters:
+  BucketName:
+    Type: String
+  AirflowApiBase:
+    Type: String
+    Description: e.g. https://airflow.internal.example (internal ALB)
+  AssetName:
+    Type: String
+    Default: s3_incoming_doorbell
+  AirflowSecretArn:
+    Type: String
+    Description: Secrets Manager ARN with {"username","password"} for the API user
+  VpcSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets with a route to the Airflow API
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+
+Resources:
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${BucketName}-events-dlq"
+      MessageRetentionPeriod: 1209600   # 14 days to investigate
+
+  EventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${BucketName}-events"
+      VisibilityTimeout: 180            # >= 6x Lambda timeout (AWS guidance)
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  EventQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: s3.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${BucketName}"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  IncomingBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: EventQueuePolicy       # policy must exist before S3 validates
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Queue: !GetAtt EventQueue.Arn
+
+  BridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: bridge
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt EventQueue.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AirflowSecretArn
+
+  BridgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${BucketName}-asset-event-bridge"
+      Runtime: python3.12
+      Handler: handler.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt BridgeRole.Arn
+      VpcConfig:
+        SubnetIds: !Ref VpcSubnetIds
+        SecurityGroupIds: !Ref SecurityGroupIds
+      Environment:
+        Variables:
+          AIRFLOW_API_BASE: !Ref AirflowApiBase
+          ASSET_NAME: !Ref AssetName
+          AIRFLOW_SECRET_ARN: !Ref AirflowSecretArn
+      # AIDEV-NOTE: deploy aws/lambda/handler.py — package it (zip) and swap
+      # this placeholder for Code: {S3Bucket:..., S3Key:...} or use SAM/CDK.
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              raise RuntimeError("placeholder - deploy aws/lambda/handler.py")
+
+  # THIS is where batching is configured (Lambda-side pipe, not SQS):
+  EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt EventQueue.Arn
+      FunctionName: !Ref BridgeFunction
+      BatchSize: 500                        # up to 10k for standard queues...
+      MaximumBatchingWindowInSeconds: 10    # ...but only with a window set
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: 5               # protects the Airflow API server
+
+Outputs:
+  QueueUrl:
+    Value: !Ref EventQueue
+  QueueDepthAlarmHint:
+    Value: "Alarm on ApproximateNumberOfMessagesVisible + DLQ depth > 0"
