@@ -52,6 +52,7 @@ services:
          "extra":{"region_name":"us-east-1","endpoint_url":"http://localstack:4566"}}
     volumes:
       - ./dags:/opt/airflow/dags
+      - ./scripts:/opt/airflow/scripts
     restart: unless-stopped
 
 volumes:

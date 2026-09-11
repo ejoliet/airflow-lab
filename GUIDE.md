@@ -5,7 +5,7 @@
 
 ## Overview
 
-Eight labs, all bash. Labs 0–5 run on docker compose (LocalExecutor) for fast iteration; Lab 6 adds emulated S3 with real bucket notifications; Lab 7 moves the same DAGs to kind + Helm + KubernetesExecutor. Labs 1–2 build the mental model;
+Nine labs, all bash. Lab 8 verifies the four FTS trigger-mechanism scenarios (Lambda push / native pull / doorbell+expand / controller-worker) claim by claim. Labs 0–5 run on docker compose (LocalExecutor) for fast iteration; Lab 6 adds emulated S3 with real bucket notifications; Lab 7 moves the same DAGs to kind + Helm + KubernetesExecutor. Labs 1–2 build the mental model;
 Labs 3–5 are the point: load, latency knobs, backpressure, idempotency, and
 failure injection. Each lab ends with a **What transfers to EKS** note.
 
@@ -435,6 +435,98 @@ the in-cluster LocalStack (→ delete `endpoint_url`, add IRSA on triggerer
 chart Postgres (→ Aurora).
 
 
+
+---
+
+## Lab 8 — Scenario Shootout: Verifying the Decision Guide (60 min)
+
+Goal: turn each claim in the FTS trigger-mechanism comparison (A Lambda push /
+B native pull / C doorbell+expand / D controller-worker) into an **Action →
+Check** pair with measurable output. New pieces: `dags/lab8_scenarios.py`
+(`fts_worker`, `scenario_c_expand`, `scenario_d_controller`),
+`scripts/scenario_a_poller.py`, `scripts/measure.sh`. The bucket now fans out
+to **two** queues: `doorbell-events` (feeds the lab6 watcher → B/C/D) and
+`scenario-a-events` (drained by the A poller). One `./drop-files.sh` burst
+feeds all four mechanisms at once.
+
+Setup: `docker compose down localstack && docker compose up -d`, then unpause
+`lab6_doorbell_ingest` (its watcher creates the asset events C and D schedule
+on) and `fts_worker`. Unpause only the scenario DAG under test; pause the
+others so `measure.sh` stays readable.
+
+### Claim A1 — "A keeps one file per run, as-is"
+
+- **Action**: `./drop-files.sh 50`, then
+  `docker compose exec airflow python /opt/airflow/scripts/scenario_a_poller.py`
+- **Check**: poller prints `created: 50`; `./scripts/measure.sh` shows
+  `fts_worker runs = 50`, each `run_id` derived from its key, each conf
+  holding exactly one key.
+
+### Claim A2 — "409-based dedupe is free"
+
+- **Action**: rerun the poller after re-delivering an event — copy an object
+  onto itself inside localstack:
+  `docker compose exec localstack awslocal s3 cp s3://roman-incoming/incoming/<key> s3://roman-incoming/incoming/<key>`
+- **Check**: poller prints `duplicate(409): 1`; `fts_worker` run count
+  unchanged. That's the deterministic-`dag_run_id` dedupe.
+
+### Claim A3 — "lowest single-file latency / burst = run pileup"
+
+- **Action**: `./drop-files.sh 1` + poller + `measure.sh` (note `latency_s`);
+  then `./drop-files.sh 500` + poller.
+- **Check**: single file lands in seconds; at 500, runs queue behind
+  `max_active_runs` (default 16). Locally the burst is DB rows; on
+  KubernetesExecutor those become pods.
+
+### Claim B — "native pull coalesces; no knob changes this"
+
+- **Action**: `./drop-files.sh 50`, wait ~30 s, `./scripts/measure.sh`.
+- **Check**: last panel shows `events ≫ runs` (e.g. 50 events, 1–3 runs).
+  Event count ≠ run count is structural — this is why B breaks the
+  one-file-per-run contract.
+
+### Claim C — "fewest runs; per-file isolation at task level; map cap"
+
+- **Action**: unpause `scenario_c_expand`, `./drop-files.sh 200`, wait,
+  `./scripts/measure.sh`.
+- **Check**: 1–2 runs whose `mapped_files` sum to 200 — each map index its
+  own TI with its own log/retries (own pod on k8s). Then probe the ceiling:
+  `./drop-files.sh 1100` in one burst → the expand fails on `max_map_length`
+  (default 1024) — raise `AIRFLOW__CORE__MAX_MAP_LENGTH` or cap claim size.
+
+### Claim D — "worker unchanged, run-per-file, dedupe via trigger_run_id"
+
+- **Action**: pause `scenario_c_expand`, unpause `scenario_d_controller`,
+  `./drop-files.sh 50`, wait, `./scripts/measure.sh`.
+- **Check**: controller ran 1–3 times; `fts_worker` gained exactly 50 runs
+  with the same deterministic run_ids Scenario A produces — same worker DAG,
+  untouched. Duplicate doorbells: controller claims 0 new keys; a colliding
+  `trigger_run_id` is **skipped** (`skip_when_already_exists=True`), not failed.
+
+### Head-to-head latency (A vs D)
+
+- **Action**: fresh burst of 50 with one mechanism active at a time;
+  compare `latency_s` on `fts_worker` after each.
+- **Check**: A ≈ poller speed (sub-second per file after token fetch). D adds
+  one hop — doorbell poll (2 s here, up to 60 s at defaults) + controller task
+  — before worker runs queue. That delta is the price of staying in-cluster.
+
+### On EKS — and what the sandbox cannot prove
+
+| Scenario | On EKS with KubernetesExecutor | Only testable in AWS |
+|---|---|---|
+| A | Lambda (concurrency 90) hammers api-server pods; each run = a worker pod; scale `apiServer.replicas`, watch Aurora writes on `dag_run` | Lambda scaling, VPC→ELB path, SSM/secret rotation, IAM |
+| B | Triggerer pod is the ingestion component (`replicas: 1` on 3.1.x) | IRSA on the triggerer service account |
+| C | Every mapped TI = a pod; a 500-file batch = 500 pods through the K8s API — autoscaler headroom + `parallelism`/pools set the drain rate | Pod-storm behavior and K8s API throttling at real scale |
+| D | Controller = one small recurring pod; worker fleet identical to A; throttle with worker `max_active_runs` + pools | Same as C for the worker fleet |
+
+Common to all: the sandbox validates **logic and latency shape, not auth or
+scale**. IRSA, SG→ELB paths, credential rotation, and 10k-burst concurrency
+only fail in the real account — budget a dev-account load test for the finalist.
+
+---
+
+## EKS Translation Table
 
 | Local piece | EKS / production |
 |-------------|------------------|
