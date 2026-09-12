@@ -1,5 +1,7 @@
-# AIDEV-NOTE: minimal lab for Airflow 3.1.8 AssetWatcher + SQS (LocalStack).
-# `docker compose up` -> Airflow UI on :8080, SQS emulator on :4566.
+# airflow-trigger-compare — local rig to compare S3->Airflow trigger mechanisms.
+# AIDEV-NOTE: Tier-1 sandbox (LocalExecutor). Validates logic + latency shape,
+# NOT auth (IRSA, SG->ELB) and NOT KubernetesExecutor pod-startup cost.
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -7,52 +9,86 @@ services:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U airflow"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
 
   localstack:
     image: localstack/localstack:latest
+    environment:
+      - SERVICES=s3,sqs
+      - AWS_DEFAULT_REGION=us-east-1
     ports:
       - "4566:4566"
-    environment:
-      - SERVICES=sqs,s3
     volumes:
-      # AIDEV-NOTE: init hook creates the queue at startup (see localstack/init-queue.sh)
-      - ./localstack/init-queue.sh:/etc/localstack/init/ready.d/init-queue.sh:ro
+      - ./localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "awslocal sqs list-queues | grep demo-events"]
+      test: ["CMD-SHELL", "awslocal sqs list-queues | grep -q files-a"]
       interval: 5s
       timeout: 5s
       retries: 20
 
   airflow:
-    image: apache/airflow:3.1.8
-    command: standalone   # runs api-server + scheduler + dag-processor + TRIGGERER (watchers live there)
-    ports:
-      - "8080:8080"
+    # AIDEV-NOTE: pin to the minor you run in prod (EKS). Override via .env.
+    image: ${AIRFLOW_IMAGE:-apache/airflow:3.1.8}
     depends_on:
       postgres:
         condition: service_healthy
       localstack:
         condition: service_healthy
     environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      # AIDEV-NOTE: dev-only convenience; bake into an image for anything real.
-      # common-messaging >=2.0 is the AIP-82 interface used by MessageQueueTrigger.
-      _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-common-messaging>=2.0 apache-airflow-providers-amazon"
-      # AWS connection pointed at LocalStack. Dummy creds are fine; endpoint_url is what matters.
-      AIRFLOW_CONN_AWS_DEFAULT: >-
-        {"conn_type":"aws","login":"test","password":"test",
-         "extra":{"region_name":"us-east-1","endpoint_url":"http://localstack:4566"}}
+      # Local-only auth shortcut. Never mirror this in a real environment.
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "True"
+      # Scheduler responsiveness for latency measurement fairness
+      AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "5"
+      # LocalStack credentials/endpoint for boto3 inside DAG tasks
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      PROCESS_SECONDS: ${PROCESS_SECONDS:-2}
+      # Scenario B only; harmless otherwise.
+      # AIDEV-NOTE: common-messaging is NOT bundled in the official image.
+      _PIP_ADDITIONAL_REQUIREMENTS: ${AIRFLOW_EXTRA_PIP:-}
+    command: airflow standalone
+    ports:
+      - "8080:8080"
     volumes:
       - ./dags:/opt/airflow/dags
-      - ./scripts:/opt/airflow/scripts
+      - ./scripts:/opt/airflow/scripts:ro
+      - ./results:/opt/airflow/results
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/api/v2/monitor/health | grep -q healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  notifier:
+    # Scenario A: stands in for the Lambda (SOCnotifierHandler shape).
+    build: ./notifier
+    depends_on:
+      airflow:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      QUEUE_NAME: files-a
+      AIRFLOW_BASE_URL: http://airflow:8080
+      AIRFLOW_USERNAME: admin
+      AIRFLOW_PASSWORD: admin
+      TARGET_DAG_ID: worker_per_file
+      MAX_CONCURRENCY: "10"   # mirrors ESM MaximumConcurrency, scaled down
     restart: unless-stopped
 
 volumes:
